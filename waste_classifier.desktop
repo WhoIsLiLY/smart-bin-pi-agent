@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Waste Classifier
+Comment=Auto Run TA Project
+# Perintah sakti untuk membuka terminal lalu jalankan script
+Exec=lxterminal -e /home/willy/launcher.sh
+Terminal=true

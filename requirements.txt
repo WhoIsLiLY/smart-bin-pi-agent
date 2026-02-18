@@ -1,0 +1,6 @@
+opencv-python
+numpy
+gpiozero
+lgpio
+picamera2
+tflite-runtime
