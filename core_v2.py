@@ -2,7 +2,8 @@ import time
 import cv2
 import numpy as np
 from gpiozero import DistanceSensor, AngularServo
-from gpiozero.pins.lgpio import LGPIOFactory 
+from gpiozero.pins.lgpio import LGPIOFactory
+import tensorflow as tf
 
 # === PICAMERA2 untuk Pi 5 (Wajib!) ===
 try:
@@ -119,11 +120,12 @@ def init_camera():
 # 3. LOAD MODEL
 # ==========================================
 def load_model():
-    print(f"[INIT] Memuat model {MODEL_PATH}...")
+    print(f"[INIT] Memuat model {MODEL_PATH} menggunakan TensorFlow...")
     try:
-        interpreter = Interpreter(model_path=MODEL_PATH)
+        # Menggunakan modul tf.lite bawaan dari full TensorFlow
+        interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
         interpreter.allocate_tensors()
-        print("[SUCCESS] Model berhasil dimuat!")
+        print(f"[SUCCESS] Model berhasil dimuat dengan TF versi: {tf.__version__}")
         return interpreter
     except Exception as e:
         print(f"[ERROR] Gagal load model: {e}")
@@ -157,9 +159,9 @@ def predict_image(frame):
         probability = 1 / (1 + np.exp(-score_logits))
         
         if probability > 0.5:
-            return "ANORGANIK", probability
+            return "ORGANIK", probability
         else:
-            return "ORGANIK", 1 - probability
+            return "ANORGANIK", 1 - probability
     except Exception as e:
         print(f"[ERROR] Prediksi gagal: {e}")
         return None, 0.0
@@ -235,7 +237,7 @@ def main():
         while True:
             jarak = sensor.distance * 100
             
-            if 2 < jarak < 15:
+            if 2 < jarak < 25:
                 print(f"\n[DETECT] Objek di {jarak:.1f} cm")
                 time.sleep(1.0)
                 

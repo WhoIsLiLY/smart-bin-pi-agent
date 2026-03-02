@@ -4,177 +4,336 @@ import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 from tensorflow.keras.models import load_model, Model
 from tensorflow.keras.preprocessing.image import load_img, img_to_array
+from scipy.ndimage import zoom
 import random
 import os
+import warnings
+warnings.filterwarnings('ignore')
 
 # ================= KONFIGURASI =================
-MODEL_FILENAME = "20k_mobilenetv3_waste_classifier.keras" 
+MODEL_FILENAME = "20k_mobilenetv3_waste_classifier_new.keras"
 IMG_SIZE = (160, 160)
 TEST_DIR = "golden_test_set"
+CLASS_NAMES = ["Anorganik", "Organik"]
 
-# Nama layer pembungkus (Lihat output summary Anda tadi)
-WRAPPER_LAYER_NAME = "MobileNetV3Large" 
-# Nama layer conv terakhir di dalam MobileNetV3 (Biasanya 'Conv_1')
-INNER_CONV_LAYER_NAME = "conv_1"
+# Layer conv yang akan dipakai untuk Grad-CAM
+# Urutan preferensi: layer lebih awal = resolusi lebih tinggi = heatmap lebih tajam
+# Untuk MobileNetV3Large, pilihan yang bagus:
+CANDIDATE_LAYERS = [
+    "expanded_conv_14_project_BN",   # Late block, resolusi lebih tinggi dari conv_1
+    "Conv_1_bn",                      # Batch norm setelah Conv_1
+    "conv_1",                         # Default fallback
+]
 
-# ================= 1. FUNGSI GRAD-CAM NESTED =================
-def get_gradcam_heatmap(img_array, full_model, wrapper_name, inner_layer_name, pred_index=None):
+# ================= UTILITAS =================
+def find_best_conv_layer(mobilenet_model):
+    """
+    Cari layer conv/BN terbaik berdasarkan nama yang diketahui ada di MobileNetV3Large.
+    Urutan prioritas: layer lebih awal = resolusi spatial lebih tinggi = heatmap lebih tajam.
+    """
+    # Prioritas dari resolusi tinggi ke rendah
+    priority_layers = [
+        "expanded_conv_14_project_bn",
+        "expanded_conv_13_project_bn",
+        "expanded_conv_12_project_bn",
+        "conv_1_bn",
+        "activation_19",
+        "conv_1",
+    ]
+
+    available = {l.name for l in mobilenet_model.layers}
+    print(f"\n   Layer tersedia ({len(available)} total), mencari kandidat...")
+
+    for candidate in priority_layers:
+        if candidate in available:
+            print(f"   → '{candidate}' ditemukan ✅")
+            return candidate
+
+    # Last resort: Conv2D atau BatchNorm pertama dari belakang
+    for layer in reversed(mobilenet_model.layers):
+        ltype = layer.__class__.__name__
+        if any(t in ltype for t in ['BatchNormalization', 'Conv2D']):
+            print(f"   → Last resort: '{layer.name}'")
+            return layer.name
+
+    return None
+
+def list_inner_layers(model, wrapper_name="MobileNetV3Large", last_n=10):
+    """Tampilkan layer-layer terakhir dalam MobileNetV3 untuk debugging"""
+    print(f"\n{'='*50}")
+    print(f"Layer terakhir dalam {wrapper_name}:")
+    inner = model.get_layer(wrapper_name)
+    for layer in inner.layers[-last_n:]:
+        try:
+            out = layer.output_shape
+        except AttributeError:
+            out = "(shape tidak tersedia)"
+        print(f"  [{layer.__class__.__name__:25s}] {layer.name:45s} -> {out}")
+    print('='*50)
+
+# ================= GRAD-CAM CORE =================
+def build_gradcam_model(full_model, conv_layer_name, wrapper_name="MobileNetV3Large"):
+    """
+    Bangun model khusus untuk Grad-CAM yang meng-expose:
+    - Output conv layer yang dipilih
+    - Output final (logit) model
     
-    # LANGKAH 1: AKSES INNER MODEL
-    # Kita ambil model MobileNetV3 yang ada di dalam model utama
-    wrapper_layer = full_model.get_layer(wrapper_name)
-    
-    # Ini tricky: Wrapper layer di Keras Functional API sebenarnya adalah model juga
-    # Kita perlu membuat "sub-model" yang outputnya adalah output layer Conv_1
-    inner_model = wrapper_layer 
-    
-    # Buat Grad Model khusus untuk Inner Model
-    # Input: Input MobileNetV3
-    # Output: [Layer Conv Terakhir, Output MobileNetV3]
-    grad_model = Model(
-        inputs=inner_model.inputs, 
-        outputs=[inner_model.get_layer(inner_layer_name).output, inner_model.output]
+    Menangani arsitektur nested (model di dalam model).
+    """
+    mobilenet = full_model.get_layer(wrapper_name)
+
+    # Cek apakah layer ada
+    layer_names = [l.name for l in mobilenet.layers]
+    if conv_layer_name not in layer_names:
+        print(f"⚠️  Layer '{conv_layer_name}' tidak ditemukan. Mencari otomatis...")
+        conv_layer_name = find_best_conv_layer(mobilenet)
+        print(f"✅ Menggunakan layer: '{conv_layer_name}'")
+
+    # Bangun partial MobileNet: input → [conv_target, mobilenet_output]
+    partial_mobilenet = Model(
+        inputs=mobilenet.inputs,
+        outputs=[
+            mobilenet.get_layer(conv_layer_name).output,
+            mobilenet.output
+        ]
     )
 
-    # LANGKAH 2: REKAM GRADIENT
-    with tf.GradientTape() as tape:
-        # Kita butuh input yang sudah melewati preprocessing awal (Sequential layer)
-        # Tapi di model Anda, 'sequential' layer sepertinya hanya Rescaling/Augmentasi.
-        # Kita coba pass img_array langsung ke grad_model.
-        
-        # Perlu preprocessing manual karena kita skip layer 'sequential' di depan
-        # img_array biasanya 0-255, MobileNetV3 butuh input spesifik tergantung training.
-        # Asumsi: layer 'sequential' Anda melakukan rescaling 1./255.
-        # Mari kita coba jalankan grad_model dengan input saat ini.
-        
-        conv_outputs, predictions = grad_model(img_array)
-        
-        # predictions di sini outputnya (None, 5, 5, 960) dari MobileNetV3
-        # Kita butuh skor klasifikasi akhir. 
-        # INI MASALAHNYA: Output Inner Model belum masuk Dense Layer klasifikasi.
-        # Kita tidak bisa pakai Grad-CAM standar cara ini untuk Nested Model.
-        pass
-
-    # --- STRATEGI ALTERNATIF YANG LEBIH ROBUST UNTUK NESTED MODEL ---
-    # Kita buat model baru yang MENGGABUNGKAN bagian inner + bagian classifier
-    
-    # 1. Input baru
+    # Susun model lengkap: raw_input → augmentasi → mobilenet → classifier
     new_input = tf.keras.Input(shape=IMG_SIZE + (3,))
+
+    # Pass lewat data augmentation (Sequential layer)
+    try:
+        x = full_model.get_layer("sequential")(new_input, training=False)
+    except:
+        x = new_input  # Jika tidak ada sequential layer
+
+    # Pass lewat mobilenet (dapat 2 output)
+    conv_out, mob_out = partial_mobilenet(x)
+
+    # Pass lewat classifier head
+    # Cari layer GAP, Dense, Dropout secara dinamis
+    head_layers = []
+    found_gap = False
+    for layer in full_model.layers:
+        ltype = layer.__class__.__name__
+        if 'GlobalAveragePooling' in ltype:
+            found_gap = True
+        if found_gap:
+            head_layers.append(layer)
+
+    x = mob_out
+    for layer in head_layers:
+        try:
+            x = layer(x, training=False)
+        except:
+            x = layer(x)
+
+    final_output = x
+
+    grad_model = Model(inputs=new_input, outputs=[conv_out, final_output])
+    return grad_model, conv_layer_name
+
+def compute_gradcam(img_array, grad_model, pred_class_idx=None):
+    """
+    Hitung Grad-CAM heatmap.
     
-    # 2. Jalan lewat Preprocessing (Sequential)
-    x = full_model.get_layer("sequential")(new_input)
+    Args:
+        img_array: (1, H, W, 3) numpy array, pixel 0-255
+        grad_model: model dengan output [conv_out, logit]
+        pred_class_idx: 0 = anorganik, 1 = organik, None = pakai prediksi
     
-    # 3. Jalan lewat MobileNet (Akses layer conv-nya juga)
-    mobilenet = full_model.get_layer(wrapper_name)
-    
-    # Kita ingin output intermediate dari dalam mobilenet
-    target_layer_output = mobilenet.get_layer(inner_layer_name).output
-    mobilenet_output = mobilenet.output
-    
-    # Buat model partial dari MobileNet
-    partial_mobilenet = Model(inputs=mobilenet.inputs, outputs=[target_layer_output, mobilenet_output])
-    
-    conv_out, mobilenet_out = partial_mobilenet(x)
-    
-    # 4. Jalan lewat Classifier (GlobalAvg -> Dense -> Dropout -> Dense)
-    x = full_model.get_layer("global_average_pooling2d_1")(mobilenet_out)
-    x = full_model.get_layer("dense_2")(x)
-    x = full_model.get_layer("dropout_1")(x)
-    final_output = full_model.get_layer("dense_3")(x)
-    
-    # Model Spesial Grad-CAM
-    grad_model_final = Model(inputs=new_input, outputs=[conv_out, final_output])
-    
-    # MULAI ULANG GRADIENT TAPE DENGAN MODEL BARU
+    Returns:
+        heatmap: numpy array (H, W) sudah dinormalisasi 0-1
+        pred_class: kelas yang diprediksi
+        confidence: confidence score
+    """
+    img_tensor = tf.cast(img_array, tf.float32)
+
     with tf.GradientTape() as tape:
-        last_conv_layer_output, preds = grad_model_final(img_array)
-        score = preds[0]
-        if pred_index == 0: score = 1 - score # Invert untuk kelas 0
-            
-    grads = tape.gradient(score, last_conv_layer_output)
+        tape.watch(img_tensor)
+        conv_outputs, predictions = grad_model(img_tensor)
+
+        # Hitung score & class
+        prob = tf.sigmoid(predictions[0, 0]).numpy()
+        if pred_class_idx is None:
+            pred_class_idx = 1 if prob > 0.5 else 0
+
+        confidence = prob if pred_class_idx == 1 else (1 - prob)
+
+        # Score untuk backprop
+        # Untuk kelas 1 (organik): gunakan logit langsung
+        # Untuk kelas 0 (anorganik): negate logit agar gradien mengarah ke kelas ini
+        if pred_class_idx == 1:
+            score = predictions[0, 0]
+        else:
+            score = -predictions[0, 0]
+
+    # Gradien terhadap output conv layer
+    grads = tape.gradient(score, conv_outputs)
+
+    # Global Average Pooling gradien → bobot tiap channel
     pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
-    last_conv_layer_output = last_conv_layer_output[0]
-    heatmap = last_conv_layer_output @ pooled_grads[..., tf.newaxis]
-    heatmap = tf.squeeze(heatmap)
-    heatmap = tf.maximum(heatmap, 0) / tf.math.reduce_max(heatmap)
-    return heatmap.numpy()
 
-# ================= 2. FUNGSI DISPLAY =================
-def display_gradcam(img_path, heatmap, alpha=0.4):
-    img = load_img(img_path, target_size=IMG_SIZE)
-    img = img_to_array(img)
-    heatmap = np.uint8(255 * heatmap)
-    jet = cm.get_cmap("jet")
-    jet_colors = jet(np.arange(256))[:, :3]
-    jet_heatmap = jet_colors[heatmap]
-    jet_heatmap = tf.keras.preprocessing.image.array_to_img(jet_heatmap)
-    jet_heatmap = jet_heatmap.resize((img.shape[1], img.shape[0]))
-    jet_heatmap = tf.keras.preprocessing.image.img_to_array(jet_heatmap)
-    superimposed_img = jet_heatmap * alpha + img
-    superimposed_img = tf.keras.preprocessing.image.array_to_img(superimposed_img)
-    return superimposed_img
+    # Weighted combination of feature maps
+    conv_outputs = conv_outputs[0]  # Hilangkan batch dim
+    heatmap = tf.reduce_sum(conv_outputs * pooled_grads, axis=-1)
 
-# ================= 3. MAIN EXECUTION =================
-if not os.path.exists(MODEL_FILENAME):
-    print(f"❌ File {MODEL_FILENAME} tidak ditemukan!")
-else:
-    print("⏳ Loading Model & Reconstructing Graph...")
-    model = load_model(MODEL_FILENAME, compile=False)
+    # ReLU: hanya ambil aktivasi positif
+    heatmap = tf.nn.relu(heatmap)
+
+    # Normalisasi dengan epsilon agar tidak divide by zero
+    heatmap = heatmap.numpy()
+    eps = 1e-8
+    heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + eps)
+
+    return heatmap, pred_class_idx, confidence
+
+def overlay_heatmap(img_path, heatmap, alpha=0.45, colormap='jet'):
+    """
+    Overlay heatmap ke gambar asli dengan smoothing untuk hasil yang tajam.
     
-    # Ambil sample
-    sample_images = []
-    anorg_path = os.path.join(TEST_DIR, 'anorganik')
-    org_path = os.path.join(TEST_DIR, 'organik')
-    
-    if os.path.exists(anorg_path) and os.listdir(anorg_path):
-        sample_images.append(os.path.join(anorg_path, random.choice(os.listdir(anorg_path))))
-    if os.path.exists(org_path) and os.listdir(org_path):
-        sample_images.append(os.path.join(org_path, random.choice(os.listdir(org_path))))
+    Perbedaan dari kode lama: 
+    - Pakai scipy zoom (bicubic) bukan PIL resize → lebih smooth
+    - Gaussian smoothing tambahan agar tidak kotak-kotak
+    """
+    from scipy.ndimage import zoom, gaussian_filter
 
-    if not sample_images:
-        print("❌ Tidak ada gambar sample.")
-    else:
-        plt.figure(figsize=(10, 6))
-        
-        for i, img_path in enumerate(sample_images):
-            try:
-                img_tensor = img_to_array(load_img(img_path, target_size=IMG_SIZE))
-                img_tensor = np.expand_dims(img_tensor, axis=0) # (1, 160, 160, 3)
-                
-                # Prediksi Biasa
-                raw_preds = model.predict(img_tensor, verbose=0)
-                score = tf.nn.sigmoid(raw_preds[0]).numpy()[0]
-                pred_label = "Organik" if score > 0.5 else "Anorganik"
-                pred_idx = 1 if score > 0.5 else 0
-                conf = score if score > 0.5 else 1 - score
-                
-                # Buat Heatmap (Panggil Fungsi Kompleks tadi)
-                heatmap = get_gradcam_heatmap(
-                    img_tensor, model, 
-                    WRAPPER_LAYER_NAME, INNER_CONV_LAYER_NAME, 
-                    pred_index=pred_idx
-                )
-                
-                final_img = display_gradcam(img_path, heatmap)
-                
-                # Plot
-                plt.subplot(2, 2, i*2 + 1)
-                plt.imshow(load_img(img_path, target_size=IMG_SIZE))
-                plt.title(f"Asli: {os.path.basename(os.path.dirname(img_path)).upper()}")
-                plt.axis('off')
-                
-                plt.subplot(2, 2, i*2 + 2)
-                plt.imshow(final_img)
-                plt.title(f"Grad-CAM: {pred_label} ({conf*100:.1f}%)")
-                plt.axis('off')
-                
-            except Exception as e:
-                print(f"❌ Error processing image {i}: {e}")
-                # Print layer names in inner model to debug
-                print("Daftar layer dalam MobileNetV3Large:")
-                inner = model.get_layer(WRAPPER_LAYER_NAME)
-                for l in inner.layers[-5:]: # Cek 5 layer terakhir
-                    print(f" - {l.name}")
+    # Load gambar asli
+    img = img_to_array(load_img(img_path, target_size=IMG_SIZE))
 
-        plt.tight_layout()
-        plt.show()
+    # Upscale heatmap ke ukuran gambar pakai bicubic interpolation
+    zoom_factor = (IMG_SIZE[0] / heatmap.shape[0], IMG_SIZE[1] / heatmap.shape[1])
+    heatmap_resized = zoom(heatmap, zoom_factor, order=3)  # order=3 = bicubic
+
+    # Gaussian smoothing untuk menghilangkan efek "kotak-kotak"
+    heatmap_smooth = gaussian_filter(heatmap_resized, sigma=8)
+
+    # Normalisasi ulang setelah smoothing
+    eps = 1e-8
+    heatmap_smooth = (heatmap_smooth - heatmap_smooth.min()) / (heatmap_smooth.max() - heatmap_smooth.min() + eps)
+
+    # Terapkan colormap
+    cmap = cm.get_cmap(colormap)
+    heatmap_colored = cmap(heatmap_smooth)[:, :, :3]  # Ambil RGB, buang alpha
+    heatmap_colored = (heatmap_colored * 255).astype(np.uint8)
+
+    # Overlay
+    img_normalized = img / 255.0
+    heatmap_normalized = heatmap_colored / 255.0
+    superimposed = (1 - alpha) * img_normalized + alpha * heatmap_normalized
+    superimposed = np.clip(superimposed, 0, 1)
+
+    return superimposed, heatmap_smooth
+
+# ================= MAIN VISUALIZATION =================
+def visualize_gradcam_batch(model_path, test_dir, n_per_class=3,
+                             wrapper_name="MobileNetV3Large",
+                             conv_layer=None):
+    """
+    Visualisasi Grad-CAM untuk n gambar per kelas.
+    Menampilkan: Gambar Asli | Heatmap Saja | Overlay
+    """
+    if not os.path.exists(model_path):
+        print(f"❌ Model '{model_path}' tidak ditemukan!")
+        return
+
+    print("⏳ Loading model...")
+    model = load_model(model_path, compile=False)
+
+    # Debug: tampilkan layer MobileNetV3
+    list_inner_layers(model, wrapper_name)
+
+    # Pilih conv layer terbaik
+    if conv_layer is None:
+        mobilenet = model.get_layer(wrapper_name)
+        conv_layer = find_best_conv_layer(mobilenet)
+        print(f"\n🎯 Conv layer yang dipakai: '{conv_layer}'")
+
+    # Build Grad-CAM model
+    print("⏳ Building Grad-CAM model...")
+    try:
+        grad_model, conv_layer_used = build_gradcam_model(model, conv_layer, wrapper_name)
+        print(f"✅ Grad-CAM model siap (layer: '{conv_layer_used}')")
+    except Exception as e:
+        print(f"❌ Gagal build Grad-CAM model: {e}")
+        return
+
+    # Kumpulkan gambar sample
+    classes = ["anorganik", "organik"]
+    all_images = []
+    for cls in classes:
+        cls_path = os.path.join(test_dir, cls)
+        if not os.path.exists(cls_path):
+            print(f"⚠️  Folder '{cls_path}' tidak ditemukan, skip.")
+            continue
+        files = [f for f in os.listdir(cls_path) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+        sampled = random.sample(files, min(n_per_class, len(files)))
+        for f in sampled:
+            all_images.append((os.path.join(cls_path, f), cls))
+
+    if not all_images:
+        print("❌ Tidak ada gambar ditemukan.")
+        return
+
+    # Plot: setiap baris = 1 gambar, kolom = [asli, heatmap, overlay]
+    n = len(all_images)
+    fig, axes = plt.subplots(n, 3, figsize=(12, 4 * n))
+    if n == 1:
+        axes = [axes]
+
+    fig.suptitle('Grad-CAM Visualization — MobileNetV3', fontsize=16, fontweight='bold', y=1.01)
+
+    for row, (img_path, true_label) in enumerate(all_images):
+        try:
+            # Prep input
+            img_array = img_to_array(load_img(img_path, target_size=IMG_SIZE))
+            img_input = np.expand_dims(img_array, axis=0)
+
+            # Hitung Grad-CAM
+            heatmap, pred_idx, confidence = compute_gradcam(img_input, grad_model)
+
+            pred_label = CLASS_NAMES[pred_idx]
+            is_correct = pred_label.lower() == true_label.lower()
+            status = "✅" if is_correct else "❌"
+
+            # Overlay
+            overlay, heatmap_smooth = overlay_heatmap(img_path, heatmap)
+
+            # Plot kolom 1: Gambar asli
+            axes[row][0].imshow(img_array.astype(np.uint8))
+            axes[row][0].set_title(f"Asli: {true_label.upper()}", fontsize=11)
+            axes[row][0].axis('off')
+
+            # Plot kolom 2: Heatmap saja
+            axes[row][1].imshow(heatmap_smooth, cmap='jet', vmin=0, vmax=1)
+            axes[row][1].set_title(f"Heatmap (raw)", fontsize=11)
+            axes[row][1].axis('off')
+            plt.colorbar(axes[row][1].get_images()[0], ax=axes[row][1], fraction=0.046)
+
+            # Plot kolom 3: Overlay
+            axes[row][2].imshow(overlay)
+            axes[row][2].set_title(
+                f"{status} Pred: {pred_label} ({confidence*100:.1f}%)",
+                fontsize=11,
+                color='green' if is_correct else 'red'
+            )
+            axes[row][2].axis('off')
+
+        except Exception as e:
+            print(f"❌ Error pada {img_path}: {e}")
+            import traceback; traceback.print_exc()
+
+    plt.tight_layout()
+    plt.savefig("gradcam_output.png", dpi=150, bbox_inches='tight')
+    plt.show()
+    print("\n✅ Selesai! Output disimpan di 'gradcam_output.png'")
+
+
+# ================= JALANKAN =================
+visualize_gradcam_batch(
+    model_path=MODEL_FILENAME,
+    test_dir=TEST_DIR,
+    n_per_class=3,           # Berapa gambar per kelas yang ditampilkan
+    wrapper_name="MobileNetV3Large",
+    conv_layer=None          # None = otomatis cari layer terbaik
+)
