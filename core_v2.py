@@ -262,10 +262,10 @@ def main():
                         else:
                             move_servo(80)
                         
-                        time.sleep(3)
+                        time.sleep(2)
                         print("[SERVO] Balik Netral")
                         move_servo(-5)
-                        time.sleep(2)
+                        time.sleep(1)
                 else:
                     consecutive_errors += 1
                     print(f"[ERROR] Frame gagal ({consecutive_errors}/{MAX_ERRORS})")
